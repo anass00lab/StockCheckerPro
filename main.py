@@ -862,7 +862,7 @@ class StockCheckerApp(ctk.CTk):
 
         sheets_cfg = self.settings["google_sheets"]
         self.sheet_url_var = ctk.StringVar(value=sheets_cfg.get("url", ""))
-        self.sheet_name_var = ctk.StringVar(value=sheets_cfg.get("sheet_name", "Sheet1"))
+        self.sheet_name_var = ctk.StringVar(value=sheets_cfg.get("sheet_name", "New parts tracked"))
 
         self._labeled_entry(sheets_card, "Google Sheet URL", self.sheet_url_var)
         self._labeled_entry(sheets_card, "Sheet Name", self.sheet_name_var)

@@ -1,12 +1,22 @@
 """
 Google Sheets integration for Stock Checker Pro.
 Handles reading parts list and writing stock results.
+
+NEW 8-COLUMN FORMAT (tab: "New parts tracked"):
+  A (1) = Part Number
+  B (2) = Description
+  C (3) = Anass Marcone Stock   -> NEVER TOUCH (Anass's manual notes)
+  D (4) = Manus Stock           -> app appends "M/D/YY: qty" each run
+  E (5) = Distribution Price    -> app appends price (Marcone price * 0.79), keeps history
+  F (6) = Model Years
+  G (7) = Anass Comment         -> NEVER TOUCH
+  H (8) = AI Comment            -> only written when AI analysis is requested
+
+Row 1 = header row. Data starts at row 2.
 """
 import re
 import gspread
 from google.oauth2.service_account import Credentials
-from google.oauth2.credentials import Credentials as OAuthCredentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from datetime import datetime
 from pathlib import Path
 import os
@@ -22,21 +32,19 @@ SCOPES = [
 
 CONFIG_DIR = Path(os.path.expanduser("~")) / "StockCheckerPro" / "config"
 
-# Column layout (1-based)
-COL_PART_NUMBER = 1
-COL_PART_NAME = 2
-COL_BRAND = 3
-COL_APPLIANCE_TYPE = 4
-COL_MARCONE_STOCK = 5
-COL_DISTRIBUTION_PRICE = 6
-COL_MODELS_COUNT = 7
-COL_YEAR_RANGE = 8
-COL_AMAZON_PRICE = 9
-COL_GOOGLE_PRICE = 10
-COL_EBAY_PRICE = 11
-COL_ANASS_COMMENT = 12  # NEVER TOUCH THIS COLUMN
+# Column layout (1-based) for the new 8-column format
+COL_PART_NUMBER = 1        # A
+COL_DESCRIPTION = 2        # B
+COL_ANASS_MARCONE = 3      # C  -- NEVER TOUCH
+COL_MANUS_STOCK = 4        # D  -- app appends stock movements here
+COL_DISTRIBUTION_PRICE = 5 # E  -- app appends price history here
+COL_MODEL_YEARS = 6        # F
+COL_ANASS_COMMENT = 7      # G  -- NEVER TOUCH
+COL_AI_COMMENT = 8         # H  -- AI analysis only
 
-DATA_START_ROW = 3  # Row 1 = section headers, Row 2 = column headers, Row 3+ = data
+DATA_START_ROW = 2  # Row 1 = headers, Row 2+ = data
+
+DISTRIBUTION_MULTIPLIER = 0.79
 
 
 def _extract_sheet_id(url: str) -> str:
@@ -44,49 +52,38 @@ def _extract_sheet_id(url: str) -> str:
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
     if match:
         return match.group(1)
+    # Maybe they pasted the raw ID
+    if re.fullmatch(r"[a-zA-Z0-9-_]{30,}", url.strip()):
+        return url.strip()
     raise ValueError(f"Could not extract sheet ID from URL: {url}")
 
 
 def _get_client(credentials_path: str = None):
-    """Get an authenticated gspread client."""
-    token_file = CONFIG_DIR / "token.json"
-    client_secret_file = CONFIG_DIR / "client_secret.json"
-
+    """Get an authenticated gspread client using a service account JSON."""
+    # Priority 1: explicit credentials path from settings
     if credentials_path and Path(credentials_path).exists():
-        client_secret_file = Path(credentials_path)
+        creds = Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
+        return gspread.authorize(creds)
 
-    # Try service account first
+    # Priority 2: service_account.json stored in config dir
     service_account_file = CONFIG_DIR / "service_account.json"
     if service_account_file.exists():
         creds = Credentials.from_service_account_file(str(service_account_file), scopes=SCOPES)
         return gspread.authorize(creds)
 
-    # Try OAuth token
-    if token_file.exists():
-        try:
-            import json
-            with open(token_file) as f:
-                token_data = json.load(f)
-            from google.oauth2.credentials import Credentials as OAuthCreds
-            creds = OAuthCreds.from_authorized_user_info(token_data, SCOPES)
-            if creds and creds.valid:
-                return gspread.authorize(creds)
-        except Exception:
-            pass
-
-    # OAuth flow
-    if client_secret_file.exists():
-        flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_file), SCOPES)
-        creds = flow.run_local_server(port=0)
-        import json
-        with open(token_file, "w") as f:
-            f.write(creds.to_json())
-        return gspread.authorize(creds)
-
-    raise Exception("No Google credentials found. Please add credentials in Settings.")
+    raise Exception(
+        "No Google credentials found. Please add your service account JSON file "
+        "path in Settings (Credentials Path)."
+    )
 
 
-def get_parts_list(sheet_url: str, sheet_name: str = "Sheet1",
+def _today() -> str:
+    """Return today's date as M/D/YY (e.g. 6/2/26)."""
+    now = datetime.now()
+    return f"{now.month}/{now.day}/{now.strftime('%y')}"
+
+
+def get_parts_list(sheet_url: str, sheet_name: str = "New parts tracked",
                    credentials_path: str = None) -> list:
     """
     Read the parts list from the Google Sheet.
@@ -111,11 +108,11 @@ def get_parts_list(sheet_url: str, sheet_name: str = "Sheet1",
             parts.append({
                 "row": row_idx,
                 "part_number": pn,
-                "part_name": row[1].strip() if len(row) > 1 else "",
-                "brand": row[2].strip() if len(row) > 2 else "",
-                "appliance_type": row[3].strip() if len(row) > 3 else "",
-                "current_stock": row[4].strip() if len(row) > 4 else "",
-                "distribution_price": row[5].strip() if len(row) > 5 else "",
+                "description": row[1].strip() if len(row) > 1 else "",
+                "anass_marcone": row[2].strip() if len(row) > 2 else "",
+                "manus_stock": row[3].strip() if len(row) > 3 else "",
+                "distribution_price": row[4].strip() if len(row) > 4 else "",
+                "model_years": row[5].strip() if len(row) > 5 else "",
             })
 
         log(f"Retrieved {len(parts)} parts from Google Sheet")
@@ -131,8 +128,13 @@ def update_stock_result(sheet_url: str, sheet_name: str, row: int,
                         marcone_price: float = None,
                         credentials_path: str = None):
     """
-    Update the stock result for a single part in the sheet.
-    Appends to existing stock history with date and bold formatting.
+    Update the Manus Stock (col D) and Distribution Price (col E) for one part.
+
+    - Manus Stock: appends "M/D/YY: qty" (or "M/D/YY: OS" if out of stock)
+      to the front of the existing history, separated by " | ".
+    - Distribution Price: computes marcone_price * 0.79. If the price changed
+      from the last recorded value, appends "M/D/YY: $price" to the history.
+      The old prices are never deleted.
     """
     try:
         client = _get_client(credentials_path)
@@ -140,35 +142,39 @@ def update_stock_result(sheet_url: str, sheet_name: str, row: int,
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet(sheet_name)
 
-        today = datetime.now().strftime("%-m/%-d/%y")  # e.g. 6/2/26
-        stock_str = str(quantity) if found and quantity > 0 else "OS"
+        today = _today()
+        stock_str = str(quantity) if (found and quantity > 0) else "OS"
         new_entry = f"{today}: {stock_str}"
 
-        # Read existing value
-        existing = worksheet.cell(row, COL_MARCONE_STOCK).value or ""
-        if existing:
-            updated = existing + " | " + new_entry
+        # --- Manus Stock (column D) ---
+        existing = worksheet.cell(row, COL_MANUS_STOCK).value or ""
+        if existing.strip():
+            updated = new_entry + " | " + existing
         else:
             updated = new_entry
+        worksheet.update_cell(row, COL_MANUS_STOCK, updated)
 
-        worksheet.update_cell(row, COL_MARCONE_STOCK, updated)
-
-        # Update distribution price if provided
+        # --- Distribution Price (column E) ---
         if marcone_price and marcone_price > 0:
-            dist_price = round(marcone_price * 0.79, 2)
+            dist_price = round(marcone_price * DISTRIBUTION_MULTIPLIER, 2)
             dist_str = f"${dist_price:.2f}"
             existing_price = worksheet.cell(row, COL_DISTRIBUTION_PRICE).value or ""
-            if existing_price:
-                # Check if price changed
-                last_price_match = re.findall(r'\$[\d.]+', existing_price)
+
+            if existing_price.strip():
+                last_price_match = re.findall(r'\$\s*([\d,]+\.?\d*)', existing_price)
+                price_changed = True
                 if last_price_match:
-                    last_price = float(last_price_match[-1].replace("$", ""))
-                    if abs(last_price - dist_price) > 0.01:
-                        date_str = datetime.now().strftime("%b %d, %Y")
-                        updated_price = existing_price + f" → {dist_str} ({date_str})"
-                        worksheet.update_cell(row, COL_DISTRIBUTION_PRICE, updated_price)
+                    try:
+                        last_price = float(last_price_match[0].replace(",", ""))
+                        price_changed = abs(last_price - dist_price) > 0.01
+                    except ValueError:
+                        price_changed = True
+                if price_changed:
+                    new_price_entry = f"{today}: {dist_str}"
+                    updated_price = new_price_entry + " | " + existing_price
+                    worksheet.update_cell(row, COL_DISTRIBUTION_PRICE, updated_price)
             else:
-                worksheet.update_cell(row, COL_DISTRIBUTION_PRICE, dist_str)
+                worksheet.update_cell(row, COL_DISTRIBUTION_PRICE, f"{today}: {dist_str}")
 
         return True
 
@@ -177,109 +183,60 @@ def update_stock_result(sheet_url: str, sheet_name: str, row: int,
         return False
 
 
-def update_part_info(sheet_url: str, sheet_name: str, row: int,
-                     part_name: str = None, brand: str = None,
-                     appliance_type: str = None,
-                     credentials_path: str = None):
-    """
-    Auto-fill part name, brand, and appliance type for new parts.
-    Only fills cells that are currently empty.
-    """
+def update_description(sheet_url: str, sheet_name: str, row: int,
+                       description: str, credentials_path: str = None):
+    """Fill the Description (col B) only if it is currently empty."""
     try:
         client = _get_client(credentials_path)
         sheet_id = _extract_sheet_id(sheet_url)
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet(sheet_name)
 
-        row_data = worksheet.row_values(row)
-
-        updates = []
-        if part_name and (len(row_data) < 2 or not row_data[1].strip()):
-            updates.append({"range": f"B{row}", "values": [[part_name]]})
-        if brand and (len(row_data) < 3 or not row_data[2].strip()):
-            updates.append({"range": f"C{row}", "values": [[brand]]})
-        if appliance_type and (len(row_data) < 4 or not row_data[3].strip()):
-            updates.append({"range": f"D{row}", "values": [[appliance_type]]})
-
-        if updates:
-            worksheet.batch_update(updates)
+        current = worksheet.cell(row, COL_DESCRIPTION).value or ""
+        if not current.strip() and description:
+            worksheet.update_cell(row, COL_DESCRIPTION, description)
         return True
-
     except Exception as e:
-        log(f"Error updating part info for row {row}: {e}", "ERROR")
+        log(f"Error updating description for row {row}: {e}", "ERROR")
         return False
 
 
-def update_benchmark_prices(sheet_url: str, sheet_name: str, row: int,
-                             amazon_price: float = None,
-                             google_price: float = None,
-                             ebay_price: float = None,
-                             credentials_path: str = None):
-    """
-    Update benchmark prices for a part. Only writes if price changed.
-    Keeps price history with dates.
-    """
+def update_model_years(sheet_url: str, sheet_name: str, row: int,
+                       model_years: str, credentials_path: str = None):
+    """Update the Model Years column (col F) only if currently empty."""
     try:
         client = _get_client(credentials_path)
         sheet_id = _extract_sheet_id(sheet_url)
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet(sheet_name)
 
-        date_str = datetime.now().strftime("%b %d, %Y")
-        price_updates = [
-            (COL_AMAZON_PRICE, amazon_price),
-            (COL_GOOGLE_PRICE, google_price),
-            (COL_EBAY_PRICE, ebay_price)
-        ]
-
-        for col, new_price in price_updates:
-            if new_price is None:
-                continue
-            new_price_str = f"${new_price:.2f}"
-            existing = worksheet.cell(row, col).value or ""
-            if not existing:
-                worksheet.update_cell(row, col, new_price_str)
-            else:
-                last_prices = re.findall(r'\$[\d.]+', existing)
-                if last_prices:
-                    last = float(last_prices[-1].replace("$", ""))
-                    if abs(last - new_price) > 0.01:
-                        updated = existing + f" → {new_price_str} ({date_str})"
-                        worksheet.update_cell(row, col, updated)
-                else:
-                    worksheet.update_cell(row, col, new_price_str)
-
+        current = worksheet.cell(row, COL_MODEL_YEARS).value or ""
+        if not current.strip() and model_years:
+            worksheet.update_cell(row, COL_MODEL_YEARS, model_years)
         return True
-
     except Exception as e:
-        log(f"Error updating benchmark prices for row {row}: {e}", "ERROR")
+        log(f"Error updating model years for row {row}: {e}", "ERROR")
         return False
 
 
-def update_model_compatibility(sheet_url: str, sheet_name: str, row: int,
-                                models_count: int, year_range: str,
-                                credentials_path: str = None):
-    """Update model compatibility columns."""
+def update_ai_comment(sheet_url: str, sheet_name: str, row: int,
+                      comment: str, credentials_path: str = None):
+    """Write the AI Comment (col H). Overwrites the previous AI comment."""
     try:
         client = _get_client(credentials_path)
         sheet_id = _extract_sheet_id(sheet_url)
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet(sheet_name)
-
-        if models_count:
-            worksheet.update_cell(row, COL_MODELS_COUNT, f"{models_count} models")
-        if year_range:
-            worksheet.update_cell(row, COL_YEAR_RANGE, year_range)
+        worksheet.update_cell(row, COL_AI_COMMENT, comment)
         return True
-
     except Exception as e:
-        log(f"Error updating model compatibility for row {row}: {e}", "ERROR")
+        log(f"Error updating AI comment for row {row}: {e}", "ERROR")
         return False
 
 
 def sync_backup_sheet(sheet_url: str, main_sheet: str, backup_sheet: str,
                       credentials_path: str = None):
-    """Sync the backup sheet with the main sheet."""
+    """Sync the backup sheet with the main sheet (full copy)."""
     try:
         log(f"Syncing backup sheet '{backup_sheet}'...")
         client = _get_client(credentials_path)
@@ -292,7 +249,6 @@ def sync_backup_sheet(sheet_url: str, main_sheet: str, backup_sheet: str,
         except gspread.exceptions.WorksheetNotFound:
             backup_ws = spreadsheet.add_worksheet(title=backup_sheet, rows=1000, cols=20)
 
-        # Copy all data from main to backup (excluding Anass Comment column)
         all_data = main_ws.get_all_values()
         if all_data:
             backup_ws.clear()
@@ -307,14 +263,15 @@ def sync_backup_sheet(sheet_url: str, main_sheet: str, backup_sheet: str,
 
 
 def test_connection(sheet_url: str, sheet_name: str,
-                    credentials_path: str = None) -> tuple[bool, str]:
+                    credentials_path: str = None):
     """Test the Google Sheets connection. Returns (success, message)."""
     try:
         client = _get_client(credentials_path)
         sheet_id = _extract_sheet_id(sheet_url)
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet(sheet_name)
-        cell_count = worksheet.row_count
-        return True, f"Connected successfully. Sheet has {cell_count} rows."
+        values = worksheet.get_all_values()
+        data_rows = len([r for r in values[1:] if r and r[0].strip()])
+        return True, f"Connected to '{spreadsheet.title}' / '{sheet_name}'. Found {data_rows} parts."
     except Exception as e:
         return False, str(e)

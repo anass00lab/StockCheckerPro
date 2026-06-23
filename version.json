@@ -1,5 +1,5 @@
 {
-  "version": "1.0.3",
+  "version": "1.0.4",
   "date": "2026-06-23",
-  "changelog": "Fixed installer — creates Desktop shortcut and VBS launcher automatically."
+  "changelog": "Updated Google Sheets engine for the new 8-column 'New parts tracked' format. Protects Anass columns C and G. Distribution price = Marcone price x 0.79 with dated price history. Manus Stock column appends dated entries."
 }

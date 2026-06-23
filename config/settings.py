@@ -23,9 +23,9 @@ DEFAULT_SETTINGS = {
     },
     "google_sheets": {
         "url": "",
-        "sheet_name": "Sheet1",
-        "backup_sheet_name": "Backup",
-        "backup_enabled": True,
+        "sheet_name": "New parts tracked",
+        "backup_sheet_name": "Back up sheet",
+        "backup_enabled": False,
         "credentials_path": ""
     },
     "scheduler": {
