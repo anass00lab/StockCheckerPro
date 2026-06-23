@@ -8,6 +8,13 @@ echo   Stock Checker Pro - Installation
 echo  ============================================================
 echo.
 
+:: Get the folder where this bat file lives (no trailing backslash)
+set "APP_DIR=%~dp0"
+if "%APP_DIR:~-1%"=="\" set "APP_DIR=%APP_DIR:~0,-1%"
+
+echo  App folder: %APP_DIR%
+echo.
+
 :: Check for Python
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
@@ -22,7 +29,6 @@ if %errorlevel% neq 0 (
     start https://www.python.org/downloads/
     exit /b 1
 )
-
 echo  [OK] Python found.
 
 :: Upgrade pip
@@ -31,12 +37,7 @@ python -m pip install --upgrade pip --quiet
 
 :: Install dependencies
 echo  [..] Installing required packages (this may take 2-3 minutes)...
-pip install customtkinter selenium webdriver-manager gspread google-auth google-auth-oauthlib beautifulsoup4 apscheduler xlsxwriter openpyxl pillow requests lxml cryptography 2>nul
-
-if %errorlevel% neq 0 (
-    echo  [!] Some packages failed to install. Trying again...
-    pip install customtkinter selenium webdriver-manager gspread google-auth google-auth-oauthlib beautifulsoup4 apscheduler xlsxwriter openpyxl pillow requests lxml cryptography
-)
+pip install customtkinter selenium webdriver-manager gspread google-auth google-auth-oauthlib beautifulsoup4 apscheduler xlsxwriter openpyxl pillow requests lxml cryptography --quiet
 
 echo  [OK] Packages installed.
 
@@ -48,25 +49,30 @@ if not exist "%USERPROFILE%\StockCheckerPro\data" mkdir "%USERPROFILE%\StockChec
 if not exist "%USERPROFILE%\StockCheckerPro\logs" mkdir "%USERPROFILE%\StockCheckerPro\logs"
 echo  [OK] Directories created.
 
-:: Create desktop shortcut
-echo  [..] Creating desktop shortcut...
-set SCRIPT_DIR=%~dp0
-set SHORTCUT_PATH=%USERPROFILE%\Desktop\Stock Checker Pro.lnk
-set TARGET=%SCRIPT_DIR%run.bat
-
-powershell -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT_PATH%'); $s.TargetPath = '%TARGET%'; $s.WorkingDirectory = '%SCRIPT_DIR%'; $s.Description = 'Stock Checker Pro'; $s.Save()" 2>nul
-
-echo  [OK] Desktop shortcut created.
-
-:: Create run.bat
+:: Create VBS launcher (launches app with no black console window)
 echo  [..] Creating launcher...
+set "VBS_PATH=%APP_DIR%\StockCheckerPro.vbs"
+set "MAIN_PY=%APP_DIR%\main.py"
 (
-echo @echo off
-echo cd /d "%SCRIPT_DIR%"
-echo start /b pythonw main.py
-) > "%SCRIPT_DIR%run.bat"
-
+echo Set WshShell = CreateObject^("WScript.Shell"^)
+echo WshShell.Run "pythonw.exe """ ^& "%MAIN_PY%" ^& """", 0, False
+) > "%VBS_PATH%"
 echo  [OK] Launcher created.
+
+:: Create Desktop shortcut with blue icon
+echo  [..] Creating Desktop shortcut...
+set "ICON_PATH=%APP_DIR%\assets\logo.ico"
+set "DESKTOP=%USERPROFILE%\Desktop"
+set "LNK_PATH=%DESKTOP%\Stock Checker Pro.lnk"
+
+powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%LNK_PATH%'); $s.TargetPath = 'wscript.exe'; $s.Arguments = '\""%VBS_PATH%\"'; $s.WorkingDirectory = '%APP_DIR%'; $s.IconLocation = '%ICON_PATH%'; $s.Description = 'Stock Checker Pro'; $s.Save()"
+
+if exist "%LNK_PATH%" (
+    echo  [OK] Desktop shortcut created!
+) else (
+    echo  [WARN] Shortcut could not be placed on Desktop automatically.
+    echo         You can double-click StockCheckerPro.vbs to launch the app.
+)
 
 echo.
 echo  ============================================================
@@ -76,11 +82,14 @@ echo.
 echo  A shortcut "Stock Checker Pro" has been added to your Desktop.
 echo  Double-click it to launch the app.
 echo.
+echo  To pin to taskbar:
+echo    Right-click the Desktop shortcut ^> "Pin to taskbar"
+echo.
 echo  First time setup:
-echo  1. Open the app
-echo  2. Go to Settings
-echo  3. Enter your Marcone credentials
-echo  4. Enter your Google Sheet URL
-echo  5. Set your schedule in the Scheduler tab
+echo    1. Open the app
+echo    2. Go to Settings tab
+echo    3. Enter your Marcone credentials
+echo    4. Enter your Google Sheet URL
+echo    5. Set your schedule in the Scheduler tab
 echo.
 pause
