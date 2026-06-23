@@ -1,0 +1,5 @@
+{
+  "version": "1.0.1",
+  "date": "2026-06-09",
+  "changelog": "Added auto-updater — the app will now check for updates automatically on startup."
+}
