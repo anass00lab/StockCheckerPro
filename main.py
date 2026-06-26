@@ -1075,7 +1075,7 @@ class StockCheckerApp(ctk.CTk):
         """Execute the stock check run in a background thread."""
         from data.logger import start_run, finish_run
         from core.marcone_engine import run_stock_check
-        from core.sheets_engine import get_parts_list, update_stock_result, sync_backup_sheet
+        from core.sheets_engine import get_parts_list, update_stock_results_batch, sync_backup_sheet
 
         settings = load_settings()
         username = settings["marcone"]["username"]
@@ -1102,18 +1102,14 @@ class StockCheckerApp(ctk.CTk):
                 stop_flag=self.stop_flag
             )
 
-            # Write results to sheet
+            # Write ALL results to the sheet in ONE batch (avoids 429 quota errors)
             from data.logger import log
-            log("Updating Google Sheet with results...")
+            log("Updating Google Sheet with results (batch)...")
+            update_stock_results_batch(sheet_url, sheet_name, results, parts,
+                                       credentials_path=creds)
+
+            # Tally errors / substitutions for the dashboard
             for result in results:
-                orig_pn = result.get("original_pn", result.get("pn", ""))
-                # Find matching part row
-                matching_part = next((p for p in parts if p["part_number"].upper() == orig_pn.upper()), None)
-                if matching_part:
-                    qty = result.get("quantity", 0)
-                    found = result.get("found", False)
-                    update_stock_result(sheet_url, sheet_name, matching_part["row"],
-                                        qty, found, credentials_path=creds)
                 if not result.get("found"):
                     errors += 1
                 if result.get("resolved_via") in ("variation", "superseded"):

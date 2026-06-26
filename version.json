@@ -1,5 +1,5 @@
 {
-  "version": "1.0.4",
-  "date": "2026-06-23",
-  "changelog": "Updated Google Sheets engine for the new 8-column 'New parts tracked' format. Protects Anass columns C and G. Distribution price = Marcone price x 0.79 with dated price history. Manus Stock column appends dated entries."
+  "version": "1.0.5",
+  "date": "2026-06-26",
+  "changelog": "Fixed Marcone login (my.marcone.com) and switched to the live beta.marcone.com portal. Stock check now uses the real search box and product detail pages, reading actual stock quantity and 'Your Price'. Distribution price = Your Price x 0.79. Parts that land on a results list are flagged as 'CHECK PN'. Google Sheet now updates in a single batch to avoid rate-limit (429) errors."
 }

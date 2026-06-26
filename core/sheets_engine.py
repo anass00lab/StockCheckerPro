@@ -183,6 +183,108 @@ def update_stock_result(sheet_url: str, sheet_name: str, row: int,
         return False
 
 
+def update_stock_results_batch(sheet_url: str, sheet_name: str, results: list,
+                              parts: list, credentials_path: str = None):
+    """
+    Write ALL stock/price results in a SINGLE batch update to avoid the
+    Google Sheets per-minute read/write quota (HTTP 429).
+
+    results: list of dicts from the Marcone engine, each containing
+        original_pn, quantity, found, needs_review, marcone_price
+    parts:   list of part dicts from get_parts_list() (must include 'row',
+             'part_number', existing 'manus_stock' and 'distribution_price')
+
+    Strategy:
+      - Read the current sheet ONCE (we already have it in `parts`).
+      - Build the new Manus Stock (col D) and Distribution Price (col E)
+        strings in memory.
+      - Send them all at once with worksheet.batch_update().
+    Returns the number of rows updated.
+    """
+    try:
+        client = _get_client(credentials_path)
+        sheet_id = _extract_sheet_id(sheet_url)
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet(sheet_name)
+
+        today = _today()
+
+        # Index existing parts by part number (upper) for quick lookup
+        parts_by_pn = {}
+        for p in parts:
+            parts_by_pn[p["part_number"].upper().strip()] = p
+
+        batch = []
+        a1 = gspread.utils.rowcol_to_a1
+        updated = 0
+
+        for result in results:
+            orig_pn = str(result.get("original_pn", result.get("pn", ""))).upper().strip()
+            part = parts_by_pn.get(orig_pn)
+            if not part:
+                continue
+            row = part["row"]
+
+            found = result.get("found", False)
+            needs_review = result.get("needs_review", False)
+            qty = result.get("quantity", 0)
+
+            # --- Manus Stock entry (col D) ---
+            if found:
+                stock_str = str(qty) if qty > 0 else "OS"
+            elif needs_review:
+                stock_str = "CHECK PN"
+            else:
+                stock_str = "NOT FOUND"
+            new_entry = f"{today}: {stock_str}"
+
+            existing_stock = (part.get("manus_stock") or "").strip()
+            updated_stock = (new_entry + " | " + existing_stock) if existing_stock else new_entry
+            batch.append({
+                "range": a1(row, COL_MANUS_STOCK),
+                "values": [[updated_stock]],
+            })
+
+            # --- Distribution Price (col E) ---
+            marcone_price = result.get("marcone_price")
+            if found and marcone_price and marcone_price > 0:
+                dist_price = round(marcone_price * DISTRIBUTION_MULTIPLIER, 2)
+                dist_str = f"${dist_price:.2f}"
+                existing_price = (part.get("distribution_price") or "").strip()
+
+                price_changed = True
+                if existing_price:
+                    last_match = re.findall(r'\$\s*([\d,]+\.?\d*)', existing_price)
+                    if last_match:
+                        try:
+                            last_price = float(last_match[0].replace(",", ""))
+                            price_changed = abs(last_price - dist_price) > 0.01
+                        except ValueError:
+                            price_changed = True
+                if price_changed:
+                    new_price_entry = f"{today}: {dist_str}"
+                    updated_price = (new_price_entry + " | " + existing_price) if existing_price else new_price_entry
+                    batch.append({
+                        "range": a1(row, COL_DISTRIBUTION_PRICE),
+                        "values": [[updated_price]],
+                    })
+
+            updated += 1
+
+        # Send everything in as few API calls as possible (chunks of 100 ranges)
+        CHUNK = 100
+        for i in range(0, len(batch), CHUNK):
+            chunk = batch[i:i + CHUNK]
+            worksheet.batch_update(chunk, value_input_option="USER_ENTERED")
+
+        log(f"Batch-updated {updated} rows in '{sheet_name}' ({len(batch)} cells).")
+        return updated
+
+    except Exception as e:
+        log(f"Error in batch sheet update: {e}", "ERROR")
+        raise
+
+
 def update_description(sheet_url: str, sheet_name: str, row: int,
                        description: str, credentials_path: str = None):
     """Fill the Description (col B) only if it is currently empty."""

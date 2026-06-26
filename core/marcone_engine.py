@@ -1,11 +1,26 @@
 """
 Marcone scraping engine for Stock Checker Pro.
 Handles login, stock checking, and smart PN recovery with memory.
+
+REAL MARCONE SITE STRUCTURE (confirmed 2026-06-26):
+  - Login page:     https://my.marcone.com/UserLogin
+  - After login:    https://beta.marcone.com/Home/Index  (logged in as "155469 - PDQ SUPPLY")
+  - Product page:   https://beta.marcone.com/Product/Detail?Part={PN}&Make={MAKE}
+  - Search box:     top "enter model or part" input + GO button.
+                    Typing a PN and submitting takes you DIRECTLY to the product
+                    page when the PN exists, or to a results LIST when it does not.
+
+  On a product detail page we read:
+    - Description   (e.g. "SPACER")
+    - Your Price    (e.g. "Your Price: $4.55")  -> Marcone price (x0.79 = distribution)
+    - Stock text    (e.g. "Only 1 left in stock (more on the way)." or
+                          "In Stock" / "Out of Stock")
 """
 import time
 import re
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
@@ -20,9 +35,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.pn_memory import get_resolved_pn, save_mapping
 from data.logger import log
 
-MARCONE_BASE = "https://www.marcone.com"
-MARCONE_LOGIN = "https://www.marcone.com/login"
-MARCONE_SEARCH = "https://www.marcone.com/search?q={pn}"
+MARCONE_LOGIN = "https://my.marcone.com/UserLogin"
+MARCONE_HOME = "https://beta.marcone.com/Home/Index"
+# Search URL on the beta portal. The portal accepts a free-text search term and
+# redirects to the product detail page when there is an exact match.
+MARCONE_SEARCH = "https://beta.marcone.com/Search/Result?searchText={pn}"
+MARCONE_PRODUCT = "https://beta.marcone.com/Product/Detail"
 
 # Progress callback for UI
 _progress_callback = None
@@ -56,7 +74,8 @@ def _create_driver(headless=True):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
@@ -64,7 +83,8 @@ def _create_driver(headless=True):
     try:
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        driver.execute_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         return driver
     except Exception as e:
         log(f"Error creating Chrome driver: {e}", "ERROR")
@@ -72,51 +92,108 @@ def _create_driver(headless=True):
 
 
 def login_to_marcone(driver, username: str, password: str) -> bool:
-    """Log into Marcone website. Returns True on success."""
+    """
+    Log into Marcone via https://my.marcone.com/UserLogin.
+    Returns True only when login is confirmed (we land on the beta portal
+    or the page shows the logged-in account name).
+    """
     try:
         log("Navigating to Marcone login page...")
         driver.get(MARCONE_LOGIN)
-        wait = WebDriverWait(driver, 15)
+        wait = WebDriverWait(driver, 25)
 
-        # Wait for login form
-        try:
-            email_field = wait.until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "input[type='email'], input[name='email'], input[id*='email'], input[name='username']")
-            ))
-        except TimeoutException:
-            # Try alternative selectors
-            email_field = wait.until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "input[type='text']")
-            ))
+        # --- Username field ---
+        username_field = None
+        username_selectors = [
+            "input[name='UserName']", "input[name='Username']",
+            "input[name='username']", "input[id*='UserName']",
+            "input[id*='Username']", "input[id*='username']",
+            "input[name='Email']", "input[type='email']",
+            "input[name='login']", "input[id*='login']",
+        ]
+        for sel in username_selectors:
+            try:
+                username_field = wait.until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+                if username_field:
+                    break
+            except TimeoutException:
+                continue
 
-        email_field.clear()
-        email_field.send_keys(username)
+        if username_field is None:
+            # Fallback: first visible text input on the page
+            text_inputs = driver.find_elements(
+                By.CSS_SELECTOR, "input[type='text']")
+            if text_inputs:
+                username_field = text_inputs[0]
+
+        if username_field is None:
+            log("Could not find the username field on the Marcone login page.", "ERROR")
+            return False
+
+        username_field.clear()
+        username_field.send_keys(username)
         time.sleep(0.5)
 
-        password_field = driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+        # --- Password field ---
+        try:
+            password_field = driver.find_element(
+                By.CSS_SELECTOR, "input[type='password']")
+        except NoSuchElementException:
+            log("Could not find the password field on the Marcone login page.", "ERROR")
+            return False
+
         password_field.clear()
         password_field.send_keys(password)
         time.sleep(0.5)
 
-        # Submit
-        submit_btn = driver.find_element(By.CSS_SELECTOR,
-            "button[type='submit'], input[type='submit'], button.login-btn, button.btn-login")
-        submit_btn.click()
-
-        # Wait for successful login (URL change or dashboard element)
-        time.sleep(3)
-        current_url = driver.current_url.lower()
-        if "login" not in current_url or "dashboard" in current_url or "account" in current_url:
-            log("Login successful")
-            return True
-        else:
-            # Check for error message
+        # --- Submit ---
+        submitted = False
+        submit_selectors = [
+            "button[type='submit']", "input[type='submit']",
+            "button#loginButton", "button.login", "button.btn-login",
+            "button.btn-primary", "input.btn-primary",
+        ]
+        for sel in submit_selectors:
             try:
-                error = driver.find_element(By.CSS_SELECTOR, ".error, .alert-danger, [class*='error']")
-                log(f"Login failed: {error.text}", "ERROR")
+                btn = driver.find_element(By.CSS_SELECTOR, sel)
+                btn.click()
+                submitted = True
+                break
             except NoSuchElementException:
-                log("Login may have succeeded (URL unchanged)", "WARNING")
-            return True  # Optimistic — proceed and fail gracefully per part
+                continue
+        if not submitted:
+            # As a fallback press Enter inside the password field
+            password_field.send_keys(Keys.RETURN)
+
+        # --- Confirm login ---
+        # Wait until we leave the login URL OR the logged-in marker appears.
+        confirmed = False
+        for _ in range(20):  # up to ~20s
+            time.sleep(1)
+            current_url = driver.current_url.lower()
+            page = driver.page_source.lower()
+            if "userlogin" not in current_url and "/login" not in current_url:
+                confirmed = True
+                break
+            # Logged-in pages greet the account, e.g. "Hello 155469"
+            if "hello" in page and str(username).lower() in page:
+                confirmed = True
+                break
+            # Detect explicit error messages
+            if any(w in page for w in ["invalid", "incorrect", "try again",
+                                       "not recognized", "wrong password"]):
+                log("Marcone reported invalid credentials. "
+                    "Check the username/password in Settings.", "ERROR")
+                return False
+
+        if confirmed:
+            log(f"Login confirmed (now at {driver.current_url})")
+            return True
+
+        log("Login did not complete — still on the login page after submitting. "
+            "Verify the Marcone username/password in Settings.", "ERROR")
+        return False
 
     except Exception as e:
         log(f"Login error: {e}", "ERROR")
@@ -128,26 +205,21 @@ def _pn_variations(pn: str) -> list:
     pn = pn.upper().strip()
     variations = [pn]
 
-    # Remove common OEM prefixes
     for prefix in ["WP", "PS", "AP", "EAP", "WD", "DA", "DC", "DE", "DD", "DG"]:
         if pn.startswith(prefix) and len(pn) > len(prefix) + 3:
             variations.append(pn[len(prefix):])
 
-    # Add WP prefix if not present
     if not pn.startswith("WP"):
         variations.append("WP" + pn)
 
-    # Remove trailing letters (e.g. W10295370A -> W10295370)
     stripped = re.sub(r'[A-Z]+$', '', pn)
     if stripped != pn and len(stripped) > 4:
         variations.append(stripped)
 
-    # Remove dashes and spaces
     no_dash = pn.replace("-", "").replace(" ", "")
     if no_dash != pn:
         variations.append(no_dash)
 
-    # Remove duplicates while preserving order
     seen = set()
     unique = []
     for v in variations:
@@ -157,72 +229,149 @@ def _pn_variations(pn: str) -> list:
     return unique
 
 
+def _parse_stock_from_text(text: str):
+    """
+    Given the visible product-page text, return an integer stock quantity.
+    Examples handled:
+      "Only 1 left in stock (more on the way)."   -> 1
+      "5 in stock"                                -> 5
+      "In Stock"                                  -> 1 (available, qty unknown)
+      "Out of Stock" / "Backordered"             -> 0
+    Returns None if no stock info is found.
+    """
+    low = text.lower()
+
+    # Out-of-stock indicators first
+    if any(p in low for p in ["out of stock", "backorder", "back order",
+                              "no longer available", "discontinued",
+                              "not available"]):
+        return 0
+
+    # "Only N left in stock" / "N left in stock" / "N in stock"
+    m = re.search(r'only\s+(\d+)\s+left\s+in\s+stock', low)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)\s+left\s+in\s+stock', low)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)\s+in\s+stock', low)
+    if m:
+        return int(m.group(1))
+
+    # Generic "in stock" with no number -> available
+    if "in stock" in low or "available" in low:
+        return 1
+
+    return None
+
+
+def _parse_price_from_text(text: str):
+    """
+    Extract the 'Your Price' dollar value from the product page text.
+    Falls back to 'Retail Price' if 'Your Price' is not present.
+    Returns a float, or None.
+    """
+    # Your Price: $4.55
+    m = re.search(r'your\s+price\s*:?\s*\$?\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    # Retail Price: $10.02 (fallback)
+    m = re.search(r'retail\s+price\s*:?\s*\$?\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return None
+
+
+def _on_product_page(driver) -> bool:
+    """True if the browser is currently on a product detail page."""
+    url = driver.current_url.lower()
+    if "/product/detail" in url:
+        return True
+    # Some flows render the detail inline; detect by the price labels.
+    page = driver.page_source.lower()
+    return ("your price" in page and "part number" in page
+            and "add to cart" in page)
+
+
 def _search_part(driver, pn: str) -> dict | None:
     """
-    Search for a part on Marcone and return stock info.
-    Returns dict with keys: pn, quantity, found, superseded_by
-    Returns None if not found.
+    Search for a part via the Marcone search box.
+    Returns one of:
+      {found True,  quantity N, marcone_price P}                  -> resolved to a product page
+      {found False, needs_review True}                            -> landed on a results LIST (ambiguous)
+      None                                                        -> nothing found / no exact match
     """
     try:
-        url = MARCONE_SEARCH.format(pn=pn)
-        driver.get(url)
-        time.sleep(2)
+        # Use the search box on the home page for the most reliable behavior.
+        driver.get(MARCONE_HOME)
+        wait = WebDriverWait(driver, 15)
 
-        wait = WebDriverWait(driver, 10)
-        page_source = driver.page_source.lower()
+        search_box = None
+        search_selectors = [
+            "input[name='searchText']", "input#searchText",
+            "input[placeholder*='model or part']",
+            "input[placeholder*='part']", "input[type='search']",
+            "input[name='q']", "input#search",
+        ]
+        for sel in search_selectors:
+            try:
+                search_box = wait.until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
+                if search_box:
+                    break
+            except TimeoutException:
+                continue
 
-        # Check for "no results" indicators
-        no_result_phrases = ["no results", "no products found", "0 results", "not found", "no items found"]
-        if any(phrase in page_source for phrase in no_result_phrases):
+        if search_box is not None:
+            search_box.clear()
+            search_box.send_keys(pn)
+            time.sleep(0.3)
+            search_box.send_keys(Keys.RETURN)
+        else:
+            # Fallback: direct search URL
+            driver.get(MARCONE_SEARCH.format(pn=pn))
+
+        # Wait for navigation to settle
+        time.sleep(3)
+
+        page_text = driver.find_element(By.TAG_NAME, "body").text
+        low = page_text.lower()
+
+        # Did we land directly on a product page?
+        if _on_product_page(driver):
+            # Make sure the part number on the page matches what we searched
+            qty = _parse_stock_from_text(page_text)
+            price = _parse_price_from_text(page_text)
+            if qty is None:
+                qty = 1  # product exists but no explicit stock text -> assume available
+            return {
+                "found": True,
+                "quantity": qty,
+                "marcone_price": price,
+                "needs_review": False,
+            }
+
+        # No results at all
+        no_result_phrases = [
+            "no results", "no products found", "0 results found",
+            "did not match any", "no items found", "no matches",
+        ]
+        if any(p in low for p in no_result_phrases):
             return None
 
-        # Try to find product/stock info
-        # Look for quantity/availability elements
-        try:
-            # Look for stock quantity
-            qty_selectors = [
-                "[class*='stock']", "[class*='quantity']", "[class*='availability']",
-                "[class*='qty']", "[data-stock]", "[class*='inventory']"
-            ]
-            for selector in qty_selectors:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for el in elements:
-                    text = el.text.strip()
-                    if text:
-                        # Extract number from text
-                        numbers = re.findall(r'\d+', text)
-                        if numbers:
-                            qty = int(numbers[0])
-                            return {"pn": pn, "quantity": qty, "found": True, "superseded_by": None}
-                        elif any(word in text.lower() for word in ["in stock", "available"]):
-                            return {"pn": pn, "quantity": 1, "found": True, "superseded_by": None}
-                        elif any(word in text.lower() for word in ["out of stock", "unavailable", "0"]):
-                            return {"pn": pn, "quantity": 0, "found": True, "superseded_by": None}
-        except Exception:
-            pass
+        # We are on a results list (multiple/partial matches) -> needs human review
+        list_indicators = ["results for", "search results", "showing",
+                            "refine", "filter results"]
+        if any(p in low for p in list_indicators):
+            return {"found": False, "needs_review": True}
 
-        # Check for superseded/replaced by notice
-        supersede_patterns = ["superseded by", "replaced by", "use part", "order instead"]
-        for pattern in supersede_patterns:
-            if pattern in page_source:
-                # Try to extract the new PN
-                try:
-                    links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/part/'], a[href*='/product/']")
-                    for link in links:
-                        href = link.get_attribute("href")
-                        if href:
-                            new_pn = href.split("/")[-1].upper()
-                            if new_pn and new_pn != pn:
-                                return {"pn": pn, "quantity": 0, "found": True, "superseded_by": new_pn}
-                except Exception:
-                    pass
-
-        # If page loaded without "no results", assume found but check for add-to-cart
-        add_to_cart = driver.find_elements(By.CSS_SELECTOR,
-            "button[class*='cart'], button[class*='add'], [class*='add-to-cart']")
-        if add_to_cart:
-            return {"pn": pn, "quantity": 1, "found": True, "superseded_by": None}
-
+        # Unknown page state -> treat as not found
         return None
 
     except Exception as e:
@@ -232,60 +381,68 @@ def _search_part(driver, pn: str) -> dict | None:
 
 def check_part_stock(driver, original_pn: str) -> dict:
     """
-    Check stock for a part with full smart recovery.
-    Returns: {pn, original_pn, quantity, found, resolved_via, error}
+    Check stock for a part with smart recovery.
+    Returns: {pn, original_pn, quantity, marcone_price, found, needs_review,
+              resolved_via, error}
     """
-    original_pn = original_pn.upper().strip()
+    original_pn = str(original_pn).upper().strip()
 
-    # Step 1: Check PN memory first
+    def _result(base, resolved_via, used_pn):
+        return {
+            "pn": used_pn,
+            "original_pn": original_pn,
+            "quantity": base.get("quantity", 0),
+            "marcone_price": base.get("marcone_price"),
+            "found": base.get("found", False),
+            "needs_review": base.get("needs_review", False),
+            "resolved_via": resolved_via,
+            "error": None if base.get("found") else (
+                "Needs review (multiple matches)" if base.get("needs_review")
+                else "Not found on Marcone"),
+        }
+
+    # Step 1: PN memory
     resolved = get_resolved_pn(original_pn)
     if resolved:
-        log(f"  Using memorized PN: {original_pn} → {resolved}")
+        log(f"  Using memorized PN: {original_pn} -> {resolved}")
         result = _search_part(driver, resolved)
-        if result:
-            result["original_pn"] = original_pn
-            result["resolved_via"] = "memory"
-            return result
+        if result and result.get("found"):
+            return _result(result, "memory", resolved)
 
-    # Step 2: Try original PN
+    # Step 2: original PN
     log(f"  Trying original PN: {original_pn}")
     result = _search_part(driver, original_pn)
-    if result:
-        if result.get("superseded_by"):
-            new_pn = result["superseded_by"]
-            log(f"  Part superseded: {original_pn} → {new_pn}, saving to PN Memory")
-            save_mapping(original_pn, new_pn, "Superseded by newer PN")
-            # Search for the new PN
-            new_result = _search_part(driver, new_pn)
-            if new_result:
-                new_result["original_pn"] = original_pn
-                new_result["resolved_via"] = "superseded"
-                return new_result
-        result["original_pn"] = original_pn
-        result["resolved_via"] = "original"
-        return result
+    if result and result.get("found"):
+        return _result(result, "original", original_pn)
+    # If the original search produced an ambiguous LIST, flag for review
+    if result and result.get("needs_review"):
+        log(f"  Ambiguous results for {original_pn} - flagged for review", "WARNING")
+        return _result(result, None, original_pn)
 
-    # Step 3: Try variations
+    # Step 3: variations
     variations = _pn_variations(original_pn)
-    for variation in variations[1:]:  # Skip first (already tried original)
+    for variation in variations[1:]:
+        if _stop_flag and _stop_flag[0]:
+            break
         log(f"  Trying variation: {variation}")
         result = _search_part(driver, variation)
-        if result:
-            log(f"  Found under variation: {original_pn} → {variation}, saving to PN Memory")
+        if result and result.get("found"):
+            log(f"  Found under variation: {original_pn} -> {variation}, "
+                f"saving to PN Memory")
             save_mapping(original_pn, variation, "Prefix/suffix variation")
-            result["original_pn"] = original_pn
-            result["resolved_via"] = "variation"
-            return result
+            return _result(result, "variation", variation)
 
-    # Step 4: Not found anywhere
+    # Step 4: not found
     log(f"  Part not found on Marcone: {original_pn}", "WARNING")
     return {
         "pn": original_pn,
         "original_pn": original_pn,
         "quantity": 0,
+        "marcone_price": None,
         "found": False,
+        "needs_review": False,
         "resolved_via": None,
-        "error": "Not found on Marcone"
+        "error": "Not found on Marcone",
     }
 
 
@@ -330,11 +487,13 @@ def run_stock_check(username: str, password: str, parts: list,
             result = check_part_stock(driver, pn)
             results.append(result)
 
-            qty = result.get("quantity", 0)
-            found = result.get("found", False)
-            if found:
-                status = str(qty) if qty > 0 else "OS"
-                log(f"  Result: {status}")
+            if result.get("found"):
+                qty = result.get("quantity", 0)
+                price = result.get("marcone_price")
+                price_str = f", price ${price:.2f}" if price else ""
+                log(f"  Result: {qty} in stock{price_str}")
+            elif result.get("needs_review"):
+                log(f"  Result: CHECK PN (multiple matches)")
             else:
                 log(f"  Result: Not found on Marcone")
 
