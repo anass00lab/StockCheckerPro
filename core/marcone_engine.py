@@ -35,7 +35,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.pn_memory import get_resolved_pn, save_mapping
 from data.logger import log
 
-MARCONE_LOGIN = "https://my.marcone.com/UserLogin"
+# IMPORTANT: beta.marcone.com has its OWN login. Logging into my.marcone.com
+# does NOT authenticate the beta portal, so we log in directly on beta.
+# The login form uses id=UserName, id=Password and a CLICK button id=loginbtn
+# (pressing Enter does not submit). A logged-in page shows a "Log Out" link
+# (href="/UserLogin/Logout").
+MARCONE_LOGIN = "https://beta.marcone.com/UserLogin"
 MARCONE_HOME = "https://beta.marcone.com/Home/Index"
 # Search URL on the beta portal. The portal accepts a free-text search term and
 # redirects to the product detail page when there is an exact match.
@@ -91,107 +96,105 @@ def _create_driver(headless=True):
         raise
 
 
+def _is_logged_in(driver) -> bool:
+    """True when the beta portal shows a logged-in session."""
+    try:
+        page = driver.page_source.lower()
+    except Exception:
+        return False
+    url = driver.current_url.lower()
+    # If we are sitting on the login page, we are NOT logged in.
+    if "userlogin" in url and "logout" not in url:
+        # Unless the page also contains the logout link (rare), treat as not logged in
+        if "/userlogin/logout" not in page:
+            return False
+    # Logged-in pages contain the Log Out link and/or a greeting.
+    if "/userlogin/logout" in page or "log out" in page or "sign out" in page:
+        return True
+    if "hello" in page:
+        return True
+    return False
+
+
 def login_to_marcone(driver, username: str, password: str) -> bool:
     """
-    Log into Marcone via https://my.marcone.com/UserLogin.
-    Returns True only when login is confirmed (we land on the beta portal
-    or the page shows the logged-in account name).
+    Log into the Marcone BETA portal at https://beta.marcone.com/UserLogin.
+
+    The login form (confirmed via captured HTML) uses:
+        username -> input id="UserName"
+        password -> input id="Password"
+        submit   -> input type="button" id="loginbtn"  (must be CLICKED)
+    A logged-in page exposes a "Log Out" link (href="/UserLogin/Logout").
+    Returns True only when the logged-in marker is confirmed.
     """
     try:
         log("Navigating to Marcone login page...")
         driver.get(MARCONE_LOGIN)
         wait = WebDriverWait(driver, 25)
 
-        # --- Username field ---
-        username_field = None
-        username_selectors = [
-            "input[name='UserName']", "input[name='Username']",
-            "input[name='username']", "input[id*='UserName']",
-            "input[id*='Username']", "input[id*='username']",
-            "input[name='Email']", "input[type='email']",
-            "input[name='login']", "input[id*='login']",
-        ]
-        for sel in username_selectors:
-            try:
-                username_field = wait.until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
-                if username_field:
-                    break
-            except TimeoutException:
-                continue
+        # --- Username field (the login form one is id=UserName) ---
+        try:
+            username_field = wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#UserName")))
+        except TimeoutException:
+            log("Could not find the UserName field on the Marcone login page.", "ERROR")
+            return False
 
-        if username_field is None:
-            # Fallback: first visible text input on the page
-            text_inputs = driver.find_elements(
-                By.CSS_SELECTOR, "input[type='text']")
-            if text_inputs:
-                username_field = text_inputs[0]
-
-        if username_field is None:
-            log("Could not find the username field on the Marcone login page.", "ERROR")
+        # --- Password field (the login form one is id=Password) ---
+        try:
+            password_field = driver.find_element(By.CSS_SELECTOR, "#Password")
+        except NoSuchElementException:
+            log("Could not find the Password field on the Marcone login page.", "ERROR")
             return False
 
         username_field.clear()
         username_field.send_keys(username)
-        time.sleep(0.5)
-
-        # --- Password field ---
-        try:
-            password_field = driver.find_element(
-                By.CSS_SELECTOR, "input[type='password']")
-        except NoSuchElementException:
-            log("Could not find the password field on the Marcone login page.", "ERROR")
-            return False
-
+        time.sleep(0.4)
         password_field.clear()
         password_field.send_keys(password)
-        time.sleep(0.5)
+        time.sleep(0.4)
 
-        # --- Submit ---
-        submitted = False
-        submit_selectors = [
-            "button[type='submit']", "input[type='submit']",
-            "button#loginButton", "button.login", "button.btn-login",
-            "button.btn-primary", "input.btn-primary",
-        ]
-        for sel in submit_selectors:
+        # --- Click the login button (id=loginbtn). Enter does NOT submit. ---
+        clicked = False
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, "#loginbtn")
             try:
-                btn = driver.find_element(By.CSS_SELECTOR, sel)
                 btn.click()
-                submitted = True
-                break
-            except NoSuchElementException:
-                continue
-        if not submitted:
-            # As a fallback press Enter inside the password field
-            password_field.send_keys(Keys.RETURN)
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+            clicked = True
+        except NoSuchElementException:
+            pass
+        if not clicked:
+            # Fallback selectors
+            for sel in ["input[type='submit']", "button[type='submit']",
+                        "button.btn-primary", "input.btn-primary"]:
+                try:
+                    driver.find_element(By.CSS_SELECTOR, sel).click()
+                    clicked = True
+                    break
+                except NoSuchElementException:
+                    continue
+        if not clicked:
+            log("Could not find the login button (#loginbtn).", "ERROR")
+            return False
 
         # --- Confirm login ---
-        # Wait until we leave the login URL OR the logged-in marker appears.
-        confirmed = False
-        for _ in range(20):  # up to ~20s
+        for _ in range(25):  # up to ~25s
             time.sleep(1)
-            current_url = driver.current_url.lower()
             page = driver.page_source.lower()
-            if "userlogin" not in current_url and "/login" not in current_url:
-                confirmed = True
-                break
-            # Logged-in pages greet the account, e.g. "Hello 155469"
-            if "hello" in page and str(username).lower() in page:
-                confirmed = True
-                break
-            # Detect explicit error messages
-            if any(w in page for w in ["invalid", "incorrect", "try again",
-                                       "not recognized", "wrong password"]):
+            # Explicit credential errors
+            if any(w in page for w in ["invalid username", "invalid password",
+                                       "incorrect password", "login failed",
+                                       "username or password"]):
                 log("Marcone reported invalid credentials. "
                     "Check the username/password in Settings.", "ERROR")
                 return False
+            if _is_logged_in(driver):
+                log(f"Login confirmed (now at {driver.current_url})")
+                return True
 
-        if confirmed:
-            log(f"Login confirmed (now at {driver.current_url})")
-            return True
-
-        log("Login did not complete — still on the login page after submitting. "
+        log("Login did not complete — the logged-in marker never appeared. "
             "Verify the Marcone username/password in Settings.", "ERROR")
         return False
 
@@ -311,6 +314,12 @@ def _search_part(driver, pn: str) -> dict | None:
         # Use the search box on the home page for the most reliable behavior.
         driver.get(MARCONE_HOME)
         wait = WebDriverWait(driver, 15)
+        time.sleep(1)
+
+        # If the session bounced back to the login page, we are not logged in.
+        if "userlogin" in driver.current_url.lower() and not _is_logged_in(driver):
+            log("  Session is not logged in (redirected to login page).", "WARNING")
+            return None
 
         search_box = None
         search_selectors = [
